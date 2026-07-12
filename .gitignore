@@ -1,0 +1,29 @@
+# Env / secrets
+.env
+.env.local
+*.pem
+*.key
+infra/nginx/certs/
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+
+# Nest
+.nest/
+
+# Prisma
+apps/*/prisma/migrations/dev/
+
+# Docker
+docker-compose.override.local.yml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

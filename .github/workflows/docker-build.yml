@@ -1,0 +1,71 @@
+name: Build and publish images
+
+# Tag-triggered, not push-to-main-triggered: this is a release action
+# (cut a vX.Y.Z tag to publish), separate from ci.yml's build-only
+# validation on every push/PR. Requires no repo configuration — auth is
+# the automatically-provided GITHUB_TOKEN against GHCR, scoped to this
+# repository.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: publish (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api-gateway, user-service, lead-service, ai-orchestrator, banking-adapter-mock]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute lowercase image name
+        id: image
+        run: |
+          set -euo pipefail
+          # GHCR requires lowercase repository paths; github.repository
+          # itself isn't guaranteed to be (a fork could rename to mixed
+          # case), so normalize explicitly rather than assume.
+          repo_lower=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=${{ env.REGISTRY }}/${repo_lower}-${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

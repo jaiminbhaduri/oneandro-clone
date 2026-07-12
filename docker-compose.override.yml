@@ -1,0 +1,47 @@
+# Auto-loaded by `docker compose up` alongside docker-compose.yml.
+# Dev-only conveniences: bind-mounted source for hot reload + debug ports.
+# Not used in CI/prod builds (docker-build.yml builds from docker-compose.yml
+# alone via `-f docker-compose.yml`).
+
+services:
+  api-gateway-1:
+    volumes:
+      - ./apps/api-gateway/src:/app/src:ro
+      - ./packages/common:/app/node_modules/@oneandro/common:ro
+    command: ["npm", "run", "start:debug"]
+
+  api-gateway-2:
+    volumes:
+      - ./apps/api-gateway/src:/app/src:ro
+      - ./packages/common:/app/node_modules/@oneandro/common:ro
+    command: ["npm", "run", "start:debug"]
+
+  user-service-1:
+    volumes:
+      - ./apps/user-service/src:/app/src:ro
+      - ./packages/common:/app/node_modules/@oneandro/common:ro
+    command: ["npm", "run", "start:debug"]
+
+  user-service-2:
+    volumes:
+      - ./apps/user-service/src:/app/src:ro
+      - ./packages/common:/app/node_modules/@oneandro/common:ro
+    command: ["npm", "run", "start:debug"]
+
+  lead-service-1:
+    volumes:
+      - ./apps/lead-service/src:/app/src:ro
+      - ./packages/common:/app/node_modules/@oneandro/common:ro
+    command: ["npm", "run", "start:debug"]
+
+  lead-service-2:
+    volumes:
+      - ./apps/lead-service/src:/app/src:ro
+      - ./packages/common:/app/node_modules/@oneandro/common:ro
+    command: ["npm", "run", "start:debug"]
+
+  ai-orchestrator:
+    volumes:
+      - ./apps/ai-orchestrator/src:/app/src:ro
+      - ./packages/common:/app/node_modules/@oneandro/common:ro
+    command: ["npm", "run", "start:debug"]

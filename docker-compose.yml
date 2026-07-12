@@ -1,0 +1,449 @@
+name: oneandro-clone
+
+x-node-env: &node-env
+  NODE_ENV: development
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+x-logging: &default-logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+networks:
+  edge:
+    name: oneandro-edge
+    driver: bridge
+  backend:
+    name: oneandro-backend
+    driver: bridge
+    internal: false # set true in prod once dev tooling is removed
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  pgadmin_data:
+  # Shared across both lead-service replicas — see
+  # apps/lead-service/src/kyc/storage/document-storage.service.ts for why
+  # this is a single-node-only storage strategy (S3/GCS in a real deploy).
+  lead_kyc_storage:
+
+services:
+  # ────────────────────────────────────────────────────────────────────────
+  # EDGE
+  # ────────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    <<: [*restart-policy, *default-logging]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./infra/nginx/snippets:/etc/nginx/snippets:ro
+    networks:
+      - edge
+      - backend
+    depends_on:
+      - api-gateway-1
+      - api-gateway-2
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ────────────────────────────────────────────────────────────────────────
+  # API GATEWAY (2 replicas, explicit for deterministic Nginx upstream)
+  # ────────────────────────────────────────────────────────────────────────
+  api-gateway-1: &api-gateway
+    build:
+      # Root context (not ./apps/api-gateway) — every service's Dockerfile
+      # needs the sibling packages/common workspace package. See
+      # apps/user-service/Dockerfile for the fully-commented pattern.
+      context: .
+      dockerfile: apps/api-gateway/Dockerfile
+    <<: [*restart-policy, *default-logging]
+    environment:
+      <<: *node-env
+      SERVICE_NAME: api-gateway-1
+      PORT: 3000
+      USER_SERVICE_URL: http://user-service-1:3001
+      LEAD_SERVICE_URL: http://lead-service-1:3002
+      AI_ORCHESTRATOR_URL: http://ai-orchestrator:3003
+    env_file: .env
+    networks:
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  api-gateway-2:
+    <<: *api-gateway
+    environment:
+      <<: *node-env
+      SERVICE_NAME: api-gateway-2
+      PORT: 3000
+      USER_SERVICE_URL: http://user-service-2:3001
+      LEAD_SERVICE_URL: http://lead-service-2:3002
+      AI_ORCHESTRATOR_URL: http://ai-orchestrator:3003
+
+  # ────────────────────────────────────────────────────────────────────────
+  # USER SERVICE (2 replicas)
+  # ────────────────────────────────────────────────────────────────────────
+  #
+  # Migrations run once, from the full `build` stage (has the Prisma CLI +
+  # devDependencies that the slim `runtime` image intentionally drops), so
+  # two app replicas never race each other applying schema changes on boot.
+  user-service-migrate:
+    build:
+      context: .
+      dockerfile: apps/user-service/Dockerfile
+      target: build
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_USERS_DB}
+    env_file: .env
+    # The `build` stage's WORKDIR is the repo root, not apps/user-service —
+    # explicit --schema, since there's no per-app WORKDIR to default from.
+    command: ["npx", "prisma", "migrate", "deploy", "--schema", "apps/user-service/prisma/schema.prisma"]
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  user-service-1: &user-service
+    build:
+      context: .
+      dockerfile: apps/user-service/Dockerfile
+    <<: [*restart-policy, *default-logging]
+    environment:
+      <<: *node-env
+      SERVICE_NAME: user-service-1
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_USERS_DB}
+    env_file: .env
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      # kafka: service_healthy only means the broker is up — with
+      # KAFKA_AUTO_CREATE_TOPICS_ENABLE=false, the actual topics this
+      # service produces/consumes don't exist until kafka-topic-init has
+      # run. Without this, there's a real startup race: this service
+      # could start producing/consuming before its topics exist.
+      kafka-topic-init:
+        condition: service_completed_successfully
+      user-service-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  user-service-2:
+    <<: *user-service
+    environment:
+      <<: *node-env
+      SERVICE_NAME: user-service-2
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_USERS_DB}
+
+  # ────────────────────────────────────────────────────────────────────────
+  # LEAD SERVICE (2 replicas). Same one-shot-migration pattern as user-service.
+  lead-service-migrate:
+    build:
+      context: .
+      dockerfile: apps/lead-service/Dockerfile
+      target: build
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_LEADS_DB}
+    env_file: .env
+    command: ["npx", "prisma", "migrate", "deploy", "--schema", "apps/lead-service/prisma/schema.prisma"]
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  lead-service-1: &lead-service
+    build:
+      context: .
+      dockerfile: apps/lead-service/Dockerfile
+    <<: [*restart-policy, *default-logging]
+    environment:
+      <<: *node-env
+      SERVICE_NAME: lead-service-1
+      PORT: 3002
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_LEADS_DB}
+      # Matches the runtime WORKDIR (/app/apps/lead-service) baked into
+      # apps/lead-service/Dockerfile, not a bare /app/storage/kyc.
+      KYC_STORAGE_DIR: /app/apps/lead-service/storage/kyc
+    env_file: .env
+    volumes:
+      - lead_kyc_storage:/app/apps/lead-service/storage
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-topic-init:
+        condition: service_completed_successfully
+      lead-service-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3002/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  lead-service-2:
+    <<: *lead-service
+    environment:
+      <<: *node-env
+      SERVICE_NAME: lead-service-2
+      PORT: 3002
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_LEADS_DB}
+      KYC_STORAGE_DIR: /app/apps/lead-service/storage/kyc
+
+  # ────────────────────────────────────────────────────────────────────────
+  # AI ORCHESTRATOR (single instance — Tier 1 LangChain + Tier 2 LangGraph).
+  # Same one-shot-migration pattern as user-service/lead-service.
+  ai-orchestrator-migrate:
+    build:
+      context: .
+      dockerfile: apps/ai-orchestrator/Dockerfile
+      target: build
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_AI_DB}
+    env_file: .env
+    command: ["npx", "prisma", "migrate", "deploy", "--schema", "apps/ai-orchestrator/prisma/schema.prisma"]
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  ai-orchestrator:
+    build:
+      context: .
+      dockerfile: apps/ai-orchestrator/Dockerfile
+    <<: [*restart-policy, *default-logging]
+    environment:
+      <<: *node-env
+      SERVICE_NAME: ai-orchestrator
+      PORT: 3003
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_AI_DB}
+      LEAD_SERVICE_URL: http://lead-service-1:3002
+    env_file: .env
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-orchestrator-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3003/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ────────────────────────────────────────────────────────────────────────
+  # BANKING ADAPTER (MOCK) — Kafka consumer, simulates external bank handoff
+  # ────────────────────────────────────────────────────────────────────────
+  banking-adapter-mock:
+    build:
+      context: .
+      dockerfile: apps/banking-adapter-mock/Dockerfile
+    <<: [*restart-policy, *default-logging]
+    environment:
+      <<: *node-env
+      SERVICE_NAME: banking-adapter-mock
+      PORT: 3004
+      USER_SERVICE_URL: http://user-service-1:3001
+      LEAD_SERVICE_URL: http://lead-service-1:3002
+    env_file: .env
+    networks:
+      - backend
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-topic-init:
+        condition: service_completed_successfully
+      mailhog:
+        condition: service_started
+      user-service-1:
+        condition: service_healthy
+      lead-service-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3004/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ────────────────────────────────────────────────────────────────────────
+  # DATA LAYER
+  # ────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    <<: [*restart-policy, *default-logging]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_USER}
+    env_file: .env
+    ports:
+      - "5432:5432" # dev convenience only; remove in prod
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.4-alpine
+    <<: [*restart-policy, *default-logging]
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${REDIS_PASSWORD}"]
+    env_file: .env
+    ports:
+      - "6379:6379" # dev convenience only; remove in prod
+    volumes:
+      - redis_data:/data
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ────────────────────────────────────────────────────────────────────────
+  # EVENT BUS — Kafka in KRaft mode (no Zookeeper), single-node for local dev
+  # ────────────────────────────────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.7.1
+    <<: [*restart-policy, *default-logging]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: "b3VuYW5kcm8tbG9jYWwtY2x1c3Rlcg" # static base64 id, dev-only
+    ports:
+      - "29092:29092" # host access for local tooling (e.g. kafkacat)
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-topic-init:
+    image: apache/kafka:3.7.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./infra/kafka/init-topics.sh:/init-topics.sh:ro
+    entrypoint: ["/bin/sh", "/init-topics.sh"]
+    networks:
+      - backend
+    restart: "no"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # DEV HELPER TOOLS (not part of the production topology)
+  # ────────────────────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    <<: *restart-policy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    env_file: .env
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - backend
+    depends_on:
+      - postgres
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    <<: *restart-policy
+    environment:
+      REDIS_HOSTS: local:redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    env_file: .env
+    ports:
+      - "8081:8081"
+    networks:
+      - backend
+    depends_on:
+      - redis
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    <<: *restart-policy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: oneandro-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "8082:8080"
+    networks:
+      - backend
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    <<: *restart-policy
+    ports:
+      - "8025:8025" # web UI
+      - "1025:1025" # SMTP
+    networks:
+      - backend

@@ -1,0 +1,17 @@
+{
+  "name": "@oneandro/common",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared types deduplicated across OneAndro services: Role, RequestUser, and the lead-status-events contract",
+  "license": "UNLICENSED",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

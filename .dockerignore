@@ -1,0 +1,15 @@
+node_modules
+dist
+build
+coverage
+*.tsbuildinfo
+.env
+.env.local
+.git
+.gitignore
+**/*.md
+docs/
+# Every service's build context is now the repo root (see each
+# Dockerfile) — these apply monorepo-wide, not just at top level.
+**/test
+**/npm-debug.log*

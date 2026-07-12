@@ -1,0 +1,56 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+// Prisma has no native vector column type or distance-operator query
+// builder (as of Prisma 6) — `Unsupported(...)` declares the column shape
+// for migrations, but every read/write against `embedding` goes through
+// raw SQL. See PgVectorStoreService in src/rag/pgvector-store.service.ts.
+model DocumentChunk {
+  id         String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  documentId String                   @map("document_id") @db.Uuid
+  source     String // e.g. "policy:kyc-requirements-v3"
+  content    String
+  embedding  Unsupported("vector(1536)")
+  metadata   Json?
+  createdAt  DateTime                 @default(now()) @map("created_at")
+
+  @@index([documentId])
+  @@map("document_chunks")
+}
+
+enum UnderwritingDecision {
+  APPROVE
+  DECLINE
+  REFER
+}
+
+// One row per Tier-2 LangGraph run — the audit trail a lending platform
+// actually needs ("why did the model say what it said"), and the record
+// UnderwritingController.getRun() reads back.
+model UnderwritingRun {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  leadId   String @map("lead_id") @db.Uuid
+  question String
+
+  decision        UnderwritingDecision
+  rationale       String
+  confidenceScore Float                @map("confidence_score")
+
+  usedSqlTemplate    String?  @map("used_sql_template")
+  retrievedSourceIds String[] @map("retrieved_source_ids") @db.Uuid
+
+  langsmithRunId String? @map("langsmith_run_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([leadId])
+  @@map("underwriting_runs")
+}

@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  APPLICANT
+  LOAN_OFFICER
+  UNDERWRITER
+  ADMIN
+}
+
+model User {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email           String    @unique
+  passwordHash    String    @map("password_hash")
+  firstName       String    @map("first_name")
+  lastName        String    @map("last_name")
+  role            Role      @default(APPLICANT)
+  isEmailVerified Boolean   @default(false) @map("is_email_verified")
+  isActive        Boolean   @default(true) @map("is_active")
+
+  // Cheap read-model projection kept in sync via the lead-status-events
+  // Kafka consumer (see src/kafka/consumers/lead-status.consumer.ts) so a
+  // user's own profile can show their latest lead status without a
+  // synchronous cross-service call to lead-service.
+  lastLeadStatus   String?   @map("last_lead_status")
+  lastLeadStatusAt DateTime? @map("last_lead_status_at")
+
+  refreshTokens RefreshToken[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+// Refresh tokens are opaque random secrets, never JWTs: the whole point is
+// that they must be server-revocable (rotation + reuse detection below), so
+// there is no benefit to a self-describing token format here — only a
+// hash of the token is ever persisted.
+model RefreshToken {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash String @unique @map("token_hash")
+
+  // All tokens descended from the same login share a family id. Rotating
+  // keeps the family; presenting an already-revoked token from a live
+  // family is treated as theft and revokes the whole family.
+  family String @db.Uuid
+
+  revoked             Boolean @default(false)
+  replacedByTokenHash String? @map("replaced_by_token_hash")
+
+  userAgent String? @map("user_agent")
+  ipAddress String? @map("ip_address")
+
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([family])
+  @@index([userId])
+  @@map("refresh_tokens")
+}

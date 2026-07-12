@@ -1,0 +1,19 @@
+{
+  "name": "oneandro-clone",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OneAndro clone — production-grade microservices portfolio project",
+  "license": "UNLICENSED",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:common": "npm run build -w @oneandro/common",
+    "test:all": "npm run test --workspaces --if-present",
+    "lint:all": "npm run lint --workspaces --if-present"
+  },
+  "allowScripts": {
+    "@scarf/scarf": false
+  }
+}

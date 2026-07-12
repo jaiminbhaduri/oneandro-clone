@@ -1,0 +1,163 @@
+# Architecture
+
+## Request flow
+
+```
+                                   ┌─────────────────────────┐
+Internet ──▶ Nginx (edge) ──▶     │  api-gateway ×2          │
+  - TLS termination (prod)        │  - JWT verify            │
+  - LB (least_conn across         │  - Redis sliding-window  │
+    api-gateway replicas)         │    rate limit (per user) │
+  - coarse IP/conn rate limits    │  - CORS                  │
+  - security headers (backstop)   │  - route + aggregate     │
+  - 25MB body cap for KYC uploads └─────────┬────────┬───────┘
+                                             │        │
+                        ┌────────────────────┘        └───────────────────┐
+                        ▼                                                 ▼
+              ┌─────────────────┐                              ┌──────────────────┐
+              │ user-service ×2 │                              │ lead-service ×2   │
+              │ - identity      │                              │ - lead lifecycle  │
+              │ - refresh-token │◀── consumes ──┐               │ - KYC intake      │
+              │   rotation      │               │               │ - publishes       │
+              └────────┬────────┘               │               │   lead-status-    │
+                       │                         │               │   events          │
+                       ▼                         │               └─────────┬─────────┘
+                  Postgres                       │                         │
+                  (users_db)                     │                         ▼
+                                                  │                  Kafka topic:
+                                                  │                  lead-status-events
+                                                  │                         │
+                                                  └─────────────────────────┼──────────────┐
+                                                                            ▼              ▼
+                                                                  banking-adapter-mock   (other
+                                                                  - simulated bank        consumers)
+                                                                    decisioning
+                                                                  - notifications (MailHog)
+                                                                            │
+                                                     BANK_HANDOFF ──────────┤ (fire-and-forget,
+                                                     event triggers         │  see HandoffService)
+                                                     a delayed decision     ▼
+                                                                  PATCH /leads/:id/status
+                                                                  {toStatus: FUNDED |
+                                                                   FUNDING_REJECTED}
+                                                                  — self-minted SYSTEM JWT —
+                                                                            │
+                                                                            ▼
+                                                              lead-service publishes the
+                                                              resulting event back onto
+                                                              lead-status-events, which
+                                                              banking-adapter-mock's own
+                                                              consumer picks up again to
+                                                              send the outcome email
+
+              ┌───────────────────┐
+   api-gateway│ ai-orchestrator    │
+   also routes│ Tier 1: LangChain  │──▶ Redis semantic cache (24h TTL, vector similarity)
+   /api/v1/ai/│   policy Q&A/RAG   │
+              │ Tier 2: LangGraph  │──▶ Router → DB Agent (Text-to-SQL) → Reranker → Synthesis
+              │   underwriting     │        │
+              └─────────┬──────────┘        ▼
+                        ▼              Postgres + pgvector (ai_db)
+                  LangSmith (trace/debug/cost audit — LANGCHAIN_TRACING_V2)
+```
+
+## Why these boundaries
+
+- **`user-service` vs `lead-service`**: identity/auth churns independently
+  from lead lifecycle and KYC document handling; separate deploy cadence,
+  separate blast radius, separate database.
+- **`api-gateway` as its own service, not just Nginx**: rate limiting needs
+  to be sliding-window and identity-aware (per user, not just per IP), which
+  requires Redis + application logic. Nginx does the cheap, stateless,
+  IP-level flood protection in front of it; the gateway does the expensive,
+  stateful, correctness-sensitive limiting. Two layers, two failure modes.
+- **Kafka over direct HTTP calls for lead status**: `user-service` and
+  `banking-adapter-mock` (and future consumers — analytics, notifications)
+  need the same event independently and asynchronously, without
+  `lead-service` knowing or caring who's listening.
+- **Two-tier AI**: Tier 1 (LangChain) is cheap, cacheable, low-latency policy
+  lookups — most traffic. Tier 2 (LangGraph) is expensive, multi-step,
+  needs full tracing — reserved for actual underwriting decisions where a
+  wrong shortcut has real cost.
+- **`ai-orchestrator` fetches lead facts over HTTP, not SQL**: it has its
+  own database (`ai_db` — `document_chunks`, `underwriting_runs`) and
+  deliberately never queries `leads_db` directly, even though both live in
+  the same Postgres instance. The DB Agent node's "Text-to-SQL" runs
+  against `underwriting_runs` (data `ai-orchestrator` actually owns);
+  current lead facts come from a real HTTP call to lead-service, forwarding
+  the caller's own access token so lead-service's normal RBAC (owner or
+  staff) is still the authority — not an over-privileged service account.
+- **The DB Agent never executes LLM-generated SQL text**: the model picks a
+  `templateId` from a fixed, zod-validated enum; the node runs the
+  corresponding hand-written parameterized query. Free-form Text-to-SQL
+  execution is a real prompt-injection/SQL-injection vector in a fintech
+  app — this trades some flexibility for the query surface being fully
+  auditable by reading the whitelist, not by trusting the model.
+- **`api-gateway` verifies JWTs but never rejects on them.** It attaches
+  identity when a token is valid (for rate-limiting) and forwards every
+  request regardless — the actual "is this allowed" decision stays with
+  whichever downstream service owns the resource, via the exact same
+  global `JwtAuthGuard` + `@Roles()` pattern in all three of them. The
+  alternative — the gateway maintaining its own map of which routes need
+  which role — is two systems that have to be kept in sync forever, and
+  in practice drift the first time someone adds an endpoint and forgets
+  the gateway's copy.
+- **Rate limiting is a sliding window (Redis ZSET + Lua), not a fixed
+  bucket.** A naive `Math.floor(now / windowMs)`-keyed counter lets a
+  client burst up to `2 × limit` requests across a bucket boundary. The
+  gateway instead scores every accepted request by its own timestamp and
+  prunes anything older than `now - windowMs` on each check, so "100
+  requests per 60s" holds for *any* rolling 60-second span. The
+  prune-count-and-maybe-add sequence runs as one atomic Lua `EVAL`
+  because two gateway replicas share one Redis — a check-then-act split
+  across round-trips would race between them.
+- **banking-adapter-mock authenticates with a self-minted `SYSTEM` JWT,
+  not a new auth mechanism.** Every service already trusts
+  `JWT_ACCESS_SECRET`; minting a short-lived (60s) token with that same
+  secret and a `SYSTEM` role claim reuses the exact verification path
+  every other request goes through, rather than bolting on mTLS or a
+  static API key as a parallel system. `user-service`'s `JwtStrategy` is
+  the one place that needed a real code change (its usual "re-derive the
+  role from the DB" check has nothing to re-derive for an identity with
+  no `users` row) — see docs/REPO_MATRIX.md's "SYSTEM role" section for
+  the full list of what changed and why the DB-backed enum stayed
+  untouched.
+- **The Kafka consumer never awaits the simulated bank delay.**
+  kafkajs processes one message at a time per consumer by default; if
+  `eachMessage` awaited HandoffService's multi-second simulated latency,
+  every other lead's events would queue up behind it. The handoff runs
+  fire-and-forget instead, which trades durability for throughput — a
+  crash mid-delay loses that particular handoff's follow-up, since the
+  offset already committed. Documented as a known simplification in
+  HandoffService's docstring, not a silent gap: a production version
+  would persist the in-flight job before acking.
+- **Every Kafka producer/consumer service depends on `kafka-topic-init`
+  completing, not just on `kafka` being healthy.** `kafka: service_healthy`
+  only means the broker answered — with `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`
+  (deliberate, so topics are provisioned explicitly, not implicitly on
+  first use), a service that starts producing/consuming before
+  `kafka-topic-init` has run would be talking to topics that don't exist
+  yet. Found while designing the CI docker-compose smoke test
+  (`.github/workflows/ci.yml`) — the first time this project's full
+  startup ordering was ever actually exercised — and fixed directly in
+  `docker-compose.yml` rather than worked around in CI.
+
+## Network segmentation
+
+- `edge` network: only `nginx` is on it and published to the host.
+- `backend` network: `api-gateway`, all services, Postgres, Redis, Kafka,
+  and dev tools. Application services are never directly reachable from the
+  host or the internet — only through the gateway, only through Nginx.
+
+## Security posture (Phase 1 pieces)
+
+| Concern | Where enforced |
+|---|---|
+| DDoS / request flood | Nginx `limit_req_zone` (general + tighter auth-endpoint zone), `limit_conn_zone` |
+| Brute-force login | Nginx `edge_auth` zone (5r/m) ahead of gateway-level lockout logic (Phase 2) |
+| Large-payload abuse | Nginx `client_max_body_size` — 2MB default, 25MB only on the KYC upload route |
+| XSS / clickjacking / MIME sniffing | `infra/nginx/snippets/security-headers.conf` |
+| Secrets in Redis config | `redis.conf` never contains the password; passed via `--requirepass` from `.env` at container start |
+| Redis command abuse | `FLUSHALL`, `FLUSHDB`, `CONFIG` renamed to no-ops in `redis.conf` |
+| SQL injection | Prisma parameterized queries in every service (Phase 2+) |
+| Lateral movement | Network segmentation (`edge` vs `backend`); Postgres/Redis ports only published for local dev convenience, removed in prod compose overlay |

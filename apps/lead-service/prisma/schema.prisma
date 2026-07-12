@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Mirrors user-service's LeadStatusEvent['status'] union — see
+// apps/user-service/src/kafka/events/lead-status.event.ts. Keeping the two
+// in sync manually is exactly the kind of drift packages/common is meant
+// to eliminate once it exists.
+enum LeadStatus {
+  CREATED
+  KYC_UPLOADED
+  CREDIT_CHECKED
+  APPROVED
+  DECLINED
+  BANK_HANDOFF
+  // Terminal outcomes of the (simulated) bank handoff — set by
+  // banking-adapter-mock via a SYSTEM-role service token, never by a
+  // human directly.
+  FUNDED
+  FUNDING_REJECTED
+}
+
+enum DocumentType {
+  GOVERNMENT_ID
+  PROOF_OF_INCOME
+  BANK_STATEMENT
+  OTHER
+}
+
+// userId / assignedLoanOfficerId / changedByUserId are foreign keys into
+// user-service's `users` table in spirit only — cross-database referential
+// integrity isn't enforceable (correct microservice DB-per-service
+// isolation), so these are plain UUID columns, not Prisma relations.
+model Lead {
+  id                    String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId                String     @map("user_id") @db.Uuid
+  assignedLoanOfficerId String?    @map("assigned_loan_officer_id") @db.Uuid
+  loanAmountRequested   Decimal    @map("loan_amount_requested") @db.Decimal(12, 2)
+  loanPurpose           String     @map("loan_purpose")
+  status                LeadStatus @default(CREATED)
+
+  // Populated by the (mocked) credit-check step at KYC_UPLOADED -> CREDIT_CHECKED.
+  creditScoreSnapshot Int? @map("credit_score_snapshot")
+
+  declineReason String? @map("decline_reason")
+
+  documents      KycDocument[]
+  statusHistory  LeadStatusHistory[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([status])
+  @@map("leads")
+}
+
+model KycDocument {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  leadId String @map("lead_id") @db.Uuid
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  documentType     DocumentType @map("document_type")
+  originalFilename String       @map("original_filename")
+  mimeType         String       @map("mime_type")
+  sizeBytes        Int          @map("size_bytes")
+  storagePath      String       @map("storage_path")
+  uploadedByUserId String       @map("uploaded_by_user_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([leadId])
+  @@map("kyc_documents")
+}
+
+// Append-only audit trail — every status transition, who made it, and why.
+// Also what lead-service replays from if it ever needs to rebuild/verify
+// what it published to Kafka.
+model LeadStatusHistory {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  leadId String @map("lead_id") @db.Uuid
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  fromStatus    LeadStatus? @map("from_status")
+  toStatus      LeadStatus  @map("to_status")
+  changedByUserId String?   @map("changed_by_user_id") @db.Uuid
+  note          String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([leadId])
+  @@map("lead_status_history")
+}
