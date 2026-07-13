@@ -113,9 +113,11 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_USERS_DB}
     env_file: .env
-    # The `build` stage's WORKDIR is the repo root, not apps/user-service —
-    # explicit --schema, since there's no per-app WORKDIR to default from.
-    command: ["npx", "prisma", "migrate", "deploy", "--schema", "apps/user-service/prisma/schema.prisma"]
+    # The `build` stage's WORKDIR is the repo root, but prisma's CLI
+    # resolves nested under apps/user-service/node_modules (not hoisted to
+    # root) and npx's binary lookup is cwd-based — so this must `cd` in
+    # first, same fix as the Dockerfiles' `deps` stage and ci.yml.
+    command: ["sh", "-c", "cd apps/user-service && npx prisma migrate deploy"]
     networks:
       - backend
     depends_on:
@@ -174,7 +176,9 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_LEADS_DB}
     env_file: .env
-    command: ["npx", "prisma", "migrate", "deploy", "--schema", "apps/lead-service/prisma/schema.prisma"]
+    # See user-service-migrate above — prisma's CLI resolves nested under
+    # apps/lead-service/node_modules, so npx needs cwd inside that dir.
+    command: ["sh", "-c", "cd apps/lead-service && npx prisma migrate deploy"]
     networks:
       - backend
     depends_on:
@@ -235,7 +239,9 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_AI_DB}
     env_file: .env
-    command: ["npx", "prisma", "migrate", "deploy", "--schema", "apps/ai-orchestrator/prisma/schema.prisma"]
+    # See user-service-migrate above — prisma's CLI resolves nested under
+    # apps/ai-orchestrator/node_modules, so npx needs cwd inside that dir.
+    command: ["sh", "-c", "cd apps/ai-orchestrator && npx prisma migrate deploy"]
     networks:
       - backend
     depends_on:
