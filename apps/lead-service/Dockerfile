@@ -3,7 +3,10 @@
 # Build context is the REPO ROOT (see docker-compose.yml's `context: .`) —
 # required so npm workspaces can resolve @oneandro/common. See
 # apps/user-service/Dockerfile for the fully-commented version of this
-# same pattern.
+# same pattern, including why each stage copies BOTH the root
+# node_modules AND apps/lead-service/node_modules — in this project's
+# actual lockfile, most of every service's dependency tree (not just
+# Prisma) resolves nested per-app, not hoisted to the workspace root.
 
 FROM node:22-alpine AS deps
 WORKDIR /app
@@ -16,11 +19,13 @@ COPY apps/ai-orchestrator/package.json ./apps/ai-orchestrator/package.json
 COPY apps/banking-adapter-mock/package.json ./apps/banking-adapter-mock/package.json
 RUN npm ci --ignore-scripts
 COPY apps/lead-service/prisma ./apps/lead-service/prisma
-RUN npx prisma generate --schema apps/lead-service/prisma/schema.prisma
+RUN cd apps/lead-service && npx prisma generate
 
 FROM node:22-alpine AS build
 WORKDIR /app
+COPY package.json package-lock.json ./
 COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/apps/lead-service/node_modules ./apps/lead-service/node_modules
 COPY packages/common ./packages/common
 COPY apps/lead-service ./apps/lead-service
 RUN npm run build -w @oneandro/common
@@ -36,8 +41,8 @@ COPY apps/lead-service/package.json ./apps/lead-service/package.json
 COPY apps/ai-orchestrator/package.json ./apps/ai-orchestrator/package.json
 COPY apps/banking-adapter-mock/package.json ./apps/banking-adapter-mock/package.json
 RUN npm ci --omit=dev
-COPY --from=deps /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=deps /app/node_modules/@prisma/client ./node_modules/@prisma/client
+COPY --from=deps /app/apps/lead-service/node_modules/.prisma ./apps/lead-service/node_modules/.prisma
+COPY --from=deps /app/apps/lead-service/node_modules/@prisma/client ./apps/lead-service/node_modules/@prisma/client
 
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
@@ -48,6 +53,7 @@ RUN apk add --no-cache wget
 RUN mkdir -p /app/apps/lead-service/storage/kyc && chown -R oneandro:oneandro /app/apps/lead-service/storage
 
 COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/apps/lead-service/node_modules ./apps/lead-service/node_modules
 COPY --from=build /app/packages/common/dist ./packages/common/dist
 COPY packages/common/package.json ./packages/common/package.json
 COPY --from=build /app/apps/lead-service/dist ./apps/lead-service/dist

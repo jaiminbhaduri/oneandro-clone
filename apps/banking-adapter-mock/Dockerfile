@@ -3,7 +3,11 @@
 # Build context is the REPO ROOT (see docker-compose.yml's `context: .`) —
 # required so npm workspaces can resolve @oneandro/common. See
 # apps/user-service/Dockerfile for the fully-commented version of this
-# same pattern (no Prisma stage here — this service has no database).
+# same pattern (no Prisma stage here — this service has no database), and
+# for why each stage copies BOTH the root node_modules AND
+# apps/banking-adapter-mock/node_modules — in this project's actual
+# lockfile, most of every service's dependency tree resolves nested
+# per-app, not hoisted to the workspace root.
 
 FROM node:22-alpine AS deps
 WORKDIR /app
@@ -18,7 +22,9 @@ RUN npm ci --ignore-scripts
 
 FROM node:22-alpine AS build
 WORKDIR /app
+COPY package.json package-lock.json ./
 COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/apps/banking-adapter-mock/node_modules ./apps/banking-adapter-mock/node_modules
 COPY packages/common ./packages/common
 COPY apps/banking-adapter-mock ./apps/banking-adapter-mock
 RUN npm run build -w @oneandro/common
@@ -43,6 +49,7 @@ RUN addgroup -S oneandro && adduser -S oneandro -G oneandro
 RUN apk add --no-cache wget
 
 COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/apps/banking-adapter-mock/node_modules ./apps/banking-adapter-mock/node_modules
 COPY --from=build /app/packages/common/dist ./packages/common/dist
 COPY packages/common/package.json ./packages/common/package.json
 COPY --from=build /app/apps/banking-adapter-mock/dist ./apps/banking-adapter-mock/dist

@@ -27,11 +27,11 @@ jobs:
       fail-fast: false
       matrix:
         service:
-          - { name: user-service, prisma_schema: apps/user-service/prisma/schema.prisma }
-          - { name: lead-service, prisma_schema: apps/lead-service/prisma/schema.prisma }
-          - { name: ai-orchestrator, prisma_schema: apps/ai-orchestrator/prisma/schema.prisma }
-          - { name: api-gateway, prisma_schema: "" }
-          - { name: banking-adapter-mock, prisma_schema: "" }
+          - { name: user-service, has_prisma: true }
+          - { name: lead-service, has_prisma: true }
+          - { name: ai-orchestrator, has_prisma: true }
+          - { name: api-gateway, has_prisma: false }
+          - { name: banking-adapter-mock, has_prisma: false }
     env:
       # Dummy values only — this job never connects to a real database,
       # Redis, or external API. Each service's ConfigModule throws at
@@ -66,13 +66,22 @@ jobs:
       - name: Build @oneandro/common
         run: npm run build:common
 
+      # `prisma`/@prisma/client resolve NESTED under
+      # apps/<service>/node_modules in this project's actual lockfile,
+      # not hoisted to the workspace root (verified directly against
+      # package-lock.json). npx's binary lookup is cwd-based, unlike
+      # TypeScript's file-relative module resolution (which is why the
+      # Type-check step below needs no such fix) — so these two steps
+      # must run from inside the app directory, not the repo root.
       - name: Validate Prisma schema
-        if: matrix.service.prisma_schema != ''
-        run: npx prisma validate --schema ${{ matrix.service.prisma_schema }}
+        if: matrix.service.has_prisma
+        working-directory: apps/${{ matrix.service.name }}
+        run: npx prisma validate
 
       - name: Generate Prisma Client
-        if: matrix.service.prisma_schema != ''
-        run: npx prisma generate --schema ${{ matrix.service.prisma_schema }}
+        if: matrix.service.has_prisma
+        working-directory: apps/${{ matrix.service.name }}
+        run: npx prisma generate
 
       - name: Type-check
         run: npx tsc --noEmit -p apps/${{ matrix.service.name }}/tsconfig.json

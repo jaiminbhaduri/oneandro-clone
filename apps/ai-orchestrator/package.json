@@ -83,8 +83,7 @@
     "coverageDirectory": "coverage",
     "testEnvironment": "node",
     "roots": [
-      "<rootDir>/src",
-      "<rootDir>/test"
+      "<rootDir>/src"
     ]
   },
   "allowScripts": {
