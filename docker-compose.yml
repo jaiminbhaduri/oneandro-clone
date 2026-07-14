@@ -37,7 +37,11 @@ services:
   # EDGE
   # ────────────────────────────────────────────────────────────────────────
   nginx:
-    image: nginx:1.27-alpine
+    # Thin wrapper around nginx:1.27-alpine that adds wget for the
+    # HEALTHCHECK below — see infra/nginx/Dockerfile.
+    build:
+      context: ./infra/nginx
+      dockerfile: Dockerfile
     <<: [*restart-policy, *default-logging]
     ports:
       - "80:80"

@@ -227,6 +227,7 @@ fintech/
 │
 ├── infra/
 │   ├── nginx/
+│   │   ├── Dockerfile                                # nginx:1.27-alpine + wget (HEALTHCHECK has no binary otherwise)
 │   │   ├── nginx.conf                                # [P1]
 │   │   ├── conf.d/default.conf                       # [P1]
 │   │   └── snippets/{security-headers.conf,proxy-params.conf} # [P1]

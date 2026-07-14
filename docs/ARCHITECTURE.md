@@ -141,6 +141,29 @@ Internet ──▶ Nginx (edge) ──▶     │  api-gateway ×2          │
   (`.github/workflows/ci.yml`) — the first time this project's full
   startup ordering was ever actually exercised — and fixed directly in
   `docker-compose.yml` rather than worked around in CI.
+- **`api-gateway`'s `GatewayMiddleware` is mounted at `'/'`, not `'*'`.**
+  Under Express 5 (pulled in by `@nestjs/platform-express` ^11), a
+  wildcard mount path makes Express treat the entire matched request
+  path as a "mount prefix": it strips that prefix from `req.url`/
+  `req.path` before invoking the middleware and re-prepends it after
+  `next()` — since the wildcard always matches the whole path, this left
+  `req.url` as `'/'` for every request, breaking every route the gateway
+  handles, including its own health check. `req.originalUrl` is
+  unaffected by mount-path stripping, but the real fix is mounting at
+  `'/'` instead: it still matches every path (all paths start with
+  `'/'`), but the matched prefix has zero length, so Express never
+  strips or restores anything. First surfaced as an `api-gateway`
+  healthcheck failure in the CI compose smoke test — this project's full
+  stack had never actually been booted together before that job existed.
+- **`nginx:1.27-alpine` ships no `curl`/`wget`.** Its Docker
+  `HEALTHCHECK` (`wget -qO- http://localhost/healthz`) failed on every
+  attempt with an exec error that never reaches nginx's own access/error
+  logs — the container ran (and served requests) fine, but was
+  permanently reported unhealthy. Fixed with a thin
+  `infra/nginx/Dockerfile` (`FROM nginx:1.27-alpine` + `apk add wget`),
+  same pattern as every other service's Dockerfile in this repo. Also
+  found via the CI compose smoke test, one step past the `api-gateway`
+  fix above.
 
 ## Network segmentation
 
