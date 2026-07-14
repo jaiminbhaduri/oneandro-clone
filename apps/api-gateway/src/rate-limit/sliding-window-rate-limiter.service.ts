@@ -38,6 +38,8 @@ export interface RateLimitDecision {
  */
 @Injectable()
 export class SlidingWindowRateLimiterService implements OnModuleDestroy {
+  private static readonly REDIS_TIMEOUT_MS = 3000;
+
   private readonly logger = new Logger(SlidingWindowRateLimiterService.name);
   private readonly redis: RedisWithSlidingWindow;
 
@@ -70,13 +72,44 @@ export class SlidingWindowRateLimiterService implements OnModuleDestroy {
     // undercount (ZADD on an existing member just updates its score).
     const member = `${now}-${randomUUID()}`;
 
-    const [allowed, remaining, retryAfterMs] = await this.redis.slidingWindow(key, now, windowMs, limit, member);
+    try {
+      const [allowed, remaining, retryAfterMs] = await this.withTimeout(
+        this.redis.slidingWindow(key, now, windowMs, limit, member),
+        SlidingWindowRateLimiterService.REDIS_TIMEOUT_MS,
+      );
 
-    if (!allowed) {
-      this.logger.warn(`rate limit exceeded: scope=${scope} identity=${identity} limit=${limit}/${windowMs}ms`);
+      if (!allowed) {
+        this.logger.warn(`rate limit exceeded: scope=${scope} identity=${identity} limit=${limit}/${windowMs}ms`);
+      }
+
+      return { allowed: allowed === 1, limit, remaining, retryAfterMs };
+    } catch (err) {
+      // Every request passing through the gateway goes through this call
+      // — a slow or unresponsive Redis must never turn into an indefinite
+      // hang for the entire gateway. Fail open (let the request through)
+      // and log loudly, so a real Redis problem gets noticed and fixed
+      // rather than silently wedging every request behind it.
+      this.logger.error(
+        `rate limiter unavailable (scope=${scope} identity=${identity}): ${err instanceof Error ? err.message : String(err)} — failing open`,
+      );
+      return { allowed: true, limit, remaining: limit, retryAfterMs: 0 };
     }
+  }
 
-    return { allowed: allowed === 1, limit, remaining, retryAfterMs };
+  private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Redis command timed out after ${ms}ms`)), ms);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
   }
 }
 

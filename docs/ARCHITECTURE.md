@@ -173,13 +173,29 @@ Internet ──▶ Nginx (edge) ──▶     │  api-gateway ×2          │
   the response open. kafkajs's own retry/backoff for a stuck
   `producer.send()` can run well past any reasonable request timeout
   (`retries: 8` starting at 300ms, capped by a 30s-per-attempt default
-  `maxRetryTime`), and this actually happened in CI: the very first
-  `POST /auth/register` after a fresh boot landed while Kafka's group
-  coordinator was still settling, and nginx's `proxy_read_timeout 30s`
-  gave up on `api-gateway` waiting for a response that was itself
-  waiting on that stuck publish. Fixed by making all three fire-and-
-  forget with a logged failure, the same trade-off already documented
-  for `HandoffService`'s own Kafka producer call.
+  `maxRetryTime`) — found while chasing a CI compose smoke test hang on
+  `POST /auth/register`. This turned out not to be that hang's actual
+  cause (see the rate-limiter timeout entry below), but the risk is real
+  independent of that: any of these three producer calls sits behind an
+  HTTP response with no bound on how long a struggling broker can hold
+  it open. Fixed by making all three fire-and-forget with a logged
+  failure, the same trade-off already documented for `HandoffService`'s
+  own Kafka producer call.
+- **`SlidingWindowRateLimiterService.consume()` had no bound on how long
+  it could wait on Redis** — every request through `api-gateway` calls
+  it (`GatewayMiddleware`'s auth/rate-limit stage, ahead of both locally
+  handled and proxied routes), so a slow or unresponsive Redis meant a
+  slow or unresponsive gateway, full stop. This was the actual cause of
+  the CI compose smoke test hang above: `POST /auth/register` never
+  produced so much as a log line in `api-gateway` itself (not even the
+  proxy layer's own error handler), meaning the request was stuck before
+  ever reaching the proxy step — the only network call in that path
+  before proxying is this one. Fixed with a 3s timeout around the Redis
+  call (`Promise.race` via `withTimeout()`) that fails *open* — allows
+  the request through, rather than blocking or rejecting it — and logs
+  loudly so a real Redis problem is visible instead of silently wedging
+  the gateway. A rate limiter should never be a single point of total
+  failure for every request behind it.
 
 ## Network segmentation
 

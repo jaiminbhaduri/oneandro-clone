@@ -125,4 +125,17 @@ describe('SlidingWindowRateLimiterService', () => {
     const allowedCount = results.filter((r) => r.allowed).length;
     expect(allowedCount).toBe(limit);
   });
+
+  it('fails open (allows the request) if Redis never responds, instead of hanging forever', async () => {
+    // Every request passing through the gateway goes through consume() —
+    // if Redis is unreachable or overloaded, that must degrade to "let
+    // the request through" within a bounded time, not stall the entire
+    // gateway indefinitely.
+    jest.spyOn(mockRedis, 'slidingWindow').mockReturnValue(new Promise(() => {}));
+
+    const decision = await service.consume('general', 'user-5', 5, 60_000);
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.remaining).toBe(5);
+  }, 10_000);
 });
