@@ -1,4 +1,4 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Lead, LeadStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { KafkaProducerService } from '../kafka/kafka-producer.service';
@@ -6,7 +6,7 @@ import { CreateLeadDto } from './dto/create-lead.dto';
 import { UpdateLeadStatusDto } from './dto/update-lead-status.dto';
 import { ListLeadsQueryDto } from './dto/list-leads-query.dto';
 import { LeadStatusStateMachine } from './state-machine/lead-status.state-machine';
-import { Role, RequestUser } from '@oneandro/common';
+import { LeadStatusEvent, Role, RequestUser } from '@oneandro/common';
 
 export interface PaginatedResult<T> {
   data: T[];
@@ -23,10 +23,27 @@ const STAFF_ROLES = [Role.LOAN_OFFICER, Role.UNDERWRITER, Role.ADMIN, Role.SYSTE
 
 @Injectable()
 export class LeadsService {
+  private readonly logger = new Logger(LeadsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly kafkaProducer: KafkaProducerService,
   ) {}
+
+  // Fire-and-forget: the lead's DB state is already committed by the time
+  // this is called, so a slow/unreachable Kafka broker must never block
+  // the HTTP response for an operation that has already succeeded.
+  // kafkajs's own retry/backoff for a stuck producer.send() can run well
+  // past any reasonable request timeout — this bit a real CI run where
+  // the broker's group coordinator hadn't fully settled seconds after
+  // startup.
+  private publishLeadStatusEventAsync(event: LeadStatusEvent): void {
+    this.kafkaProducer.publishLeadStatusEvent(event).catch((err: unknown) => {
+      this.logger.error(
+        `failed to publish lead status event (${event.status}) for lead ${event.leadId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
 
   private isStaff(role: Role): boolean {
     return STAFF_ROLES.includes(role);
@@ -46,7 +63,7 @@ export class LeadsService {
       data: { leadId: lead.id, fromStatus: null, toStatus: LeadStatus.CREATED, changedByUserId: userId },
     });
 
-    await this.kafkaProducer.publishLeadStatusEvent({
+    this.publishLeadStatusEventAsync({
       leadId: lead.id,
       userId: lead.userId,
       status: LeadStatus.CREATED,
@@ -149,7 +166,7 @@ export class LeadsService {
       }),
     ]);
 
-    await this.kafkaProducer.publishLeadStatusEvent({
+    this.publishLeadStatusEventAsync({
       leadId: updated.id,
       userId: updated.userId,
       status: toStatus,

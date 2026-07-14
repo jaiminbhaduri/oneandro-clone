@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import * as argon2 from 'argon2';
 import { User } from '@prisma/client';
 import { UsersService } from '../users/users.service';
@@ -8,6 +8,8 @@ import { KafkaProducerService } from '../kafka/kafka-producer.service';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly usersService: UsersService,
     private readonly tokenService: TokenService,
@@ -26,13 +28,25 @@ export class AuthService {
 
     const tokens = await this.tokenService.issueTokenPair(user, meta);
 
-    await this.kafkaProducer.publishUserRegistered({
-      userId: user.id,
-      email: user.email,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      registeredAt: user.createdAt.toISOString(),
-    });
+    // Fire-and-forget: the user is already fully created and holds valid
+    // tokens by this point, so a slow/unreachable Kafka broker must never
+    // block the registration response. kafkajs's own retry/backoff for a
+    // stuck producer.send() can run well past any reasonable request
+    // timeout (its default maxRetryTime alone is 30s, before accounting
+    // for all 8 configured retries) — this bit a real CI run where the
+    // broker's group coordinator hadn't fully settled seconds after
+    // startup.
+    this.kafkaProducer
+      .publishUserRegistered({
+        userId: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        registeredAt: user.createdAt.toISOString(),
+      })
+      .catch((err: unknown) => {
+        this.logger.error(`failed to publish user.registered for ${user.id}: ${err instanceof Error ? err.message : String(err)}`);
+      });
 
     return { user, tokens };
   }

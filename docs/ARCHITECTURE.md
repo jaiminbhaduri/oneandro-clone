@@ -164,6 +164,22 @@ Internet ──▶ Nginx (edge) ──▶     │  api-gateway ×2          │
   same pattern as every other service's Dockerfile in this repo. Also
   found via the CI compose smoke test, one step past the `api-gateway`
   fix above.
+- **Publishing a Kafka event never blocks the HTTP response that
+  triggered it** (`AuthService#register`'s `user.registered` publish,
+  `LeadsService#create`/`#transition`'s `lead-status-events` publish).
+  All three publish *after* the triggering DB write already committed —
+  the operation has fully succeeded from the caller's perspective by
+  that point, so a slow or momentarily-unavailable broker must not hold
+  the response open. kafkajs's own retry/backoff for a stuck
+  `producer.send()` can run well past any reasonable request timeout
+  (`retries: 8` starting at 300ms, capped by a 30s-per-attempt default
+  `maxRetryTime`), and this actually happened in CI: the very first
+  `POST /auth/register` after a fresh boot landed while Kafka's group
+  coordinator was still settling, and nginx's `proxy_read_timeout 30s`
+  gave up on `api-gateway` waiting for a response that was itself
+  waiting on that stuck publish. Fixed by making all three fire-and-
+  forget with a logged failure, the same trade-off already documented
+  for `HandoffService`'s own Kafka producer call.
 
 ## Network segmentation
 
