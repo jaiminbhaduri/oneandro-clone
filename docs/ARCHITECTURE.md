@@ -185,17 +185,46 @@ Internet ──▶ Nginx (edge) ──▶     │  api-gateway ×2          │
   it could wait on Redis** — every request through `api-gateway` calls
   it (`GatewayMiddleware`'s auth/rate-limit stage, ahead of both locally
   handled and proxied routes), so a slow or unresponsive Redis meant a
-  slow or unresponsive gateway, full stop. This was the actual cause of
-  the CI compose smoke test hang above: `POST /auth/register` never
-  produced so much as a log line in `api-gateway` itself (not even the
-  proxy layer's own error handler), meaning the request was stuck before
-  ever reaching the proxy step — the only network call in that path
-  before proxying is this one. Fixed with a 3s timeout around the Redis
-  call (`Promise.race` via `withTimeout()`) that fails *open* — allows
-  the request through, rather than blocking or rejecting it — and logs
-  loudly so a real Redis problem is visible instead of silently wedging
-  the gateway. A rate limiter should never be a single point of total
-  failure for every request behind it.
+  slow or unresponsive gateway, full stop. Found while still chasing the
+  same `POST /auth/register` hang as the two entries above — this
+  wasn't its cause either (Redis was responding fine the whole time; see
+  the `fixRequestBody` entry below for what actually was), but the gap
+  was real regardless: nothing bounded how long a struggling Redis could
+  hold up every request behind it. Fixed with a 3s timeout around the
+  Redis call (`Promise.race` via `withTimeout()`) that fails *open* —
+  allows the request through, rather than blocking or rejecting it — and
+  logs loudly so a real Redis problem is visible instead of silently
+  wedging the gateway. A rate limiter should never be a single point of
+  total failure for every request behind it.
+- **The actual cause of that `POST /auth/register` hang: NestJS's global
+  body parser and `http-proxy-middleware` both want to own the request
+  stream.** `NestFactory.create()` applies Express's body parser ahead
+  of every middleware, including `GatewayMiddleware` — so by the time a
+  proxied request reaches `createProxyMiddleware()`'s internals, the
+  incoming stream has already been fully drained into `req.body`, and
+  `http-proxy-middleware`'s normal behavior (pipe the raw request stream
+  to the target) has nothing left to pipe. The outgoing request to the
+  target still carries the original `Content-Length` header, so the
+  target sits waiting for body bytes that will never arrive — and
+  because the connection itself is healthy, nothing on either side ever
+  errors or times out on its own. `GET /healthz` has no body, so it was
+  never affected and every healthcheck kept passing throughout; the
+  *first* proxied request with a body (`POST /auth/register`, the smoke
+  test's very first real call) hung until nginx's own
+  `proxy_read_timeout 30s` gave up — with zero log output anywhere in
+  `api-gateway` or the target service, since neither side's application
+  code was ever reached. Confirmed by temporarily logging every raw
+  incoming request as the first line of `main.ts`'s middleware chain
+  (before `helmet`/`cookie-parser`/anything else): the request reached
+  Express fine, and the last thing logged before the hang was a
+  `util._extend` deprecation warning from inside `http-proxy-middleware`
+  itself. Fixed with the library's own documented answer to this exact
+  problem — `fixRequestBody(proxyReq, req)` in the `proxyReq` handler,
+  which re-serializes `req.body` onto the outgoing request when the
+  source stream was already drained. Verified locally without Docker: a
+  throwaway Node HTTP server stood in for `user-service`, and the same
+  `POST /auth/register` payload that previously vanished came back
+  correctly echoed once this was in place.
 
 ## Network segmentation
 

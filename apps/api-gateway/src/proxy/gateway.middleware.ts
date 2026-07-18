@@ -1,7 +1,7 @@
 import { Injectable, Logger, NestMiddleware } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NextFunction, Request, Response } from 'express';
-import { createProxyMiddleware } from 'http-proxy-middleware';
+import { createProxyMiddleware, fixRequestBody } from 'http-proxy-middleware';
 import type { RequestHandler as ProxyRequestHandler } from 'http-proxy-middleware';
 import { JwtVerifierService } from '../auth/jwt-verifier.service';
 import { SlidingWindowRateLimiterService } from '../rate-limit/sliding-window-rate-limiter.service';
@@ -65,6 +65,22 @@ export class GatewayMiddleware implements NestMiddleware {
         proxyReq: (proxyReq, req) => {
           const requestId = (req as Request).headers['x-request-id'];
           if (requestId) proxyReq.setHeader('x-request-id', requestId);
+
+          // NestJS's global body parser (applied ahead of every
+          // middleware, including this one) already fully consumed the
+          // incoming request stream to populate req.body — so there is
+          // nothing left for http-proxy-middleware's normal stream-piping
+          // to forward. Without this, any proxied request WITH a body
+          // (every non-GET auth/leads/ai call) hangs forever: the
+          // upstream request goes out with a Content-Length promising a
+          // body that never arrives, so the target never responds and
+          // this proxy never errors either — it just sits there. This
+          // hit a real CI run: GET /healthz (no body) always worked, but
+          // the very first POST (auth/register) hung for the full 30s
+          // nginx timeout with zero logs anywhere. fixRequestBody
+          // re-serializes req.body onto the outgoing request when the
+          // source stream was already drained.
+          fixRequestBody(proxyReq, req as Request);
         },
         proxyRes: (proxyRes, req) => {
           const started = (req as TimedRequest)._gatewayStart;
