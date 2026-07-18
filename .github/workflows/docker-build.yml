@@ -19,12 +19,22 @@ permissions:
 
 jobs:
   publish:
-    name: publish (${{ matrix.service }})
+    name: publish (${{ matrix.service.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: [api-gateway, user-service, lead-service, ai-orchestrator, banking-adapter-mock]
+        # Same {name, context, dockerfile} shape as ci.yml's docker-build
+        # matrix — nginx needs its own build context (infra/nginx, no
+        # packages/common dependency) rather than the root context the
+        # five app services share.
+        service:
+          - { name: api-gateway, context: ., dockerfile: apps/api-gateway/Dockerfile }
+          - { name: user-service, context: ., dockerfile: apps/user-service/Dockerfile }
+          - { name: lead-service, context: ., dockerfile: apps/lead-service/Dockerfile }
+          - { name: ai-orchestrator, context: ., dockerfile: apps/ai-orchestrator/Dockerfile }
+          - { name: banking-adapter-mock, context: ., dockerfile: apps/banking-adapter-mock/Dockerfile }
+          - { name: nginx, context: ./infra/nginx, dockerfile: infra/nginx/Dockerfile }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,7 +50,7 @@ jobs:
           # itself isn't guaranteed to be (a fork could rename to mixed
           # case), so normalize explicitly rather than assume.
           repo_lower=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          echo "name=${{ env.REGISTRY }}/${repo_lower}-${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+          echo "name=${{ env.REGISTRY }}/${repo_lower}-${{ matrix.service.name }}" >> "$GITHUB_OUTPUT"
 
       - name: Derive image tags
         id: meta
@@ -59,13 +69,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push ${{ matrix.service }}
+      - name: Build and push ${{ matrix.service.name }}
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: apps/${{ matrix.service }}/Dockerfile
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          cache-from: type=gha,scope=${{ matrix.service.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service.name }}
