@@ -50,7 +50,16 @@ WORKDIR /app
 
 RUN addgroup -S oneandro && adduser -S oneandro -G oneandro
 RUN apk add --no-cache wget
-RUN mkdir -p /app/apps/lead-service/storage/kyc && chown -R oneandro:oneandro /app/apps/lead-service/storage
+# Only the volume mount point itself, not the nested kyc/ subdirectory
+# DocumentStorageService creates lazily at runtime (mkdir recursive:true
+# on every save, inheriting this ownership). Baking storage/kyc into the
+# image meant Docker had to seed that nested directory into the fresh
+# named volume on first mount — and with two lead-service replicas
+# mounting the same volume and starting at nearly the same time, that
+# seeding raced: "failed to mkdir .../lead_kyc_storage/_data/kyc: file
+# exists". An empty, correctly-owned mount point has nothing nested to
+# race on.
+RUN mkdir -p /app/apps/lead-service/storage && chown -R oneandro:oneandro /app/apps/lead-service/storage
 
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=prod-deps /app/apps/lead-service/node_modules ./apps/lead-service/node_modules

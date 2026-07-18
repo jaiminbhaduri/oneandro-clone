@@ -225,6 +225,22 @@ Internet ──▶ Nginx (edge) ──▶     │  api-gateway ×2          │
   throwaway Node HTTP server stood in for `user-service`, and the same
   `POST /auth/register` payload that previously vanished came back
   correctly echoed once this was in place.
+- **Baking `storage/kyc` into `lead-service`'s image raced Docker's own
+  volume-seeding on startup.** `lead-service-1` and `lead-service-2`
+  both mount the same named volume (`lead_kyc_storage`) and start at
+  nearly the same time; when Docker mounts a fresh, empty named volume
+  over a path that has content in the image, it seeds the volume by
+  copying that image content in — and two containers doing that
+  concurrently for the same volume raced on creating the nested `kyc`
+  subdirectory: `failed to mkdir .../lead_kyc_storage/_data/kyc: file
+  exists`, hard-failing container creation. `DocumentStorageService`
+  already creates directories lazily and idempotently at runtime
+  (`mkdir(dirname(absolutePath), { recursive: true })` on every save),
+  so the image never needed to pre-create the nested directory in the
+  first place — only the volume's mount point itself needs to exist with
+  correct ownership. Fixed by narrowing the Dockerfile's `RUN mkdir` to
+  just `storage/` (the mount point), not `storage/kyc` (the nested path
+  Docker was racing on seeding).
 
 ## Network segmentation
 
