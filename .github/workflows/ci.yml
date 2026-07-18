@@ -89,17 +89,28 @@ jobs:
       - name: Test
         run: npm run test -w @oneandro/${{ matrix.service.name }}
 
-  # Builds every service's real Dockerfile (root build context — see
-  # docs/REPO_MATRIX.md's "npm workspaces and what it changed in Docker").
-  # This project has no Docker daemon available in local dev, so this job
-  # is the *first* place these Dockerfiles are ever actually built.
+  # Builds every service's real Dockerfile. The five app services share a
+  # root build context (see docs/REPO_MATRIX.md's "npm workspaces and what
+  # it changed in Docker" — they need the sibling packages/common
+  # workspace); nginx is self-contained (infra/nginx/Dockerfile, see its
+  # own comment header) and gets its own context/dockerfile pair instead
+  # of forcing it through the apps/<service>/Dockerfile convention the
+  # other five share. This project has no Docker daemon available in
+  # local dev, so this job is the *first* place these Dockerfiles are
+  # ever actually built.
   docker-build:
-    name: docker-build (${{ matrix.service }})
+    name: docker-build (${{ matrix.service.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: [api-gateway, user-service, lead-service, ai-orchestrator, banking-adapter-mock]
+        service:
+          - { name: api-gateway, context: ., dockerfile: apps/api-gateway/Dockerfile }
+          - { name: user-service, context: ., dockerfile: apps/user-service/Dockerfile }
+          - { name: lead-service, context: ., dockerfile: apps/lead-service/Dockerfile }
+          - { name: ai-orchestrator, context: ., dockerfile: apps/ai-orchestrator/Dockerfile }
+          - { name: banking-adapter-mock, context: ., dockerfile: apps/banking-adapter-mock/Dockerfile }
+          - { name: nginx, context: ./infra/nginx, dockerfile: infra/nginx/Dockerfile }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -107,15 +118,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build ${{ matrix.service }} image
+      - name: Build ${{ matrix.service.name }} image
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: apps/${{ matrix.service }}/Dockerfile
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
           push: false
-          tags: oneandro/${{ matrix.service }}:ci
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          tags: oneandro/${{ matrix.service.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.service.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service.name }}
 
   # Boots the actual production images via docker-compose (explicitly NOT
   # docker-compose.override.yml's dev hot-reload variant — see the -f flag
